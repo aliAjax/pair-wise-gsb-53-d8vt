@@ -2,7 +2,7 @@
 from typing import Any, Dict, List, Optional
 
 from .audit import AuditRecorder
-from .domain import Actor, PermissionDenied, text
+from .domain import Actor, Conflict, PermissionDenied, text
 from .repository import Repository
 from .rules import DomainRules
 
@@ -50,6 +50,8 @@ class Service:
         if not self.rules.role_can_action(actor.role, action):
             raise PermissionDenied("角色无权执行该操作")
         record = self.repository.get(record_id)
+        if int(expected_version) != int(record["version"]):
+            raise Conflict("版本冲突，请刷新后重试")
         self.rules.require_transition(record, action)
         new_state, new_payload, summary = self.rules.apply_action(record, action, data or {})
         return self.repository.mutate(
@@ -59,8 +61,25 @@ class Service:
             payload=new_payload,
             actor_id=actor.user_id,
             action=action,
-            details={"summary": summary, "input": data or {}, "from": record["state"], "to": new_state},
+            details={"summary": summary, "input": data or {}, "from": record["state"], "to": new_state, "basis": new_payload.get("deadline_basis")},
         )
+
+    def upgrade_legacy_records(self) -> int:
+        """旧数据升级：按当前案件状态补齐停表记录，返回升级条数。"""
+        upgraded = 0
+        for record in self.repository.all_records():
+            result = self.rules.backfill_tolling(record)
+            if result is None:
+                continue
+            payload, basis = result
+            self.repository.migrate_payload(
+                record_id=record["id"],
+                payload=payload,
+                actor_id="system",
+                details={"summary": "旧数据升级：按当前案件状态补齐停表记录", "state": record["state"], "basis": basis},
+            )
+            upgraded += 1
+        return upgraded
 
     def timeline(self, actor: Actor, record_id: int) -> List[Dict[str, Any]]:
         actor = self._actor(actor)

@@ -92,6 +92,11 @@ class Repository:
                 rows = connection.execute("SELECT * FROM records ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [self._row(row) for row in rows]
 
+    def all_records(self) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM records ORDER BY id").fetchall()
+        return [self._row(row) for row in rows]
+
     def mutate(self, record_id: int, expected_version: int, state: str, payload: Dict[str, Any], actor_id: str, action: str, details: Dict[str, Any]) -> Dict[str, Any]:
         now = _now()
         with self._connect() as connection:
@@ -111,6 +116,27 @@ class Repository:
             connection.execute(
                 "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
                 (record_id, action, actor_id, version, json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+            connection.commit()
+        return self._row(result)
+
+    def migrate_payload(self, record_id: int, payload: Dict[str, Any], actor_id: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        """旧数据升级：payload更新与审计事件在同一事务写入，不改动版本号。"""
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT version FROM records WHERE id=?", (record_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("记录不存在")
+            connection.execute(
+                "UPDATE records SET payload=?, updated_at=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False, sort_keys=True), now, record_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, "migrated", actor_id, int(row["version"]), json.dumps(details, ensure_ascii=False, sort_keys=True), now),
             )
             result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
             connection.commit()
