@@ -51,7 +51,10 @@ class Service:
             raise PermissionDenied("角色无权执行该操作")
         record = self.repository.get(record_id)
         self.rules.require_transition(record, action)
-        new_state, new_payload, summary = self.rules.apply_action(record, action, data or {})
+        new_state, new_payload, summary, calculation = self.rules.apply_action(record, action, data or {})
+        details = {"summary": summary, "input": data or {}, "from": record["state"], "to": new_state}
+        if calculation:
+            details["calculation"] = calculation
         return self.repository.mutate(
             record_id=record_id,
             expected_version=int(expected_version),
@@ -59,7 +62,7 @@ class Service:
             payload=new_payload,
             actor_id=actor.user_id,
             action=action,
-            details={"summary": summary, "input": data or {}, "from": record["state"], "to": new_state},
+            details=details,
         )
 
     def timeline(self, actor: Actor, record_id: int) -> List[Dict[str, Any]]:

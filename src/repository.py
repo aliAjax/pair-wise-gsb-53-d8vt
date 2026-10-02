@@ -51,6 +51,57 @@ class Repository:
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
                 """
             )
+            self._migrate_legacy_tolling(connection)
+
+    def _migrate_legacy_tolling(self, connection: sqlite3.Connection) -> None:
+        """旧数据升级：按当前案件状态补齐停表区间与期限字段，幂等可重复执行。"""
+        rows = connection.execute("SELECT id,state,version,payload FROM records").fetchall()
+        now = _now()
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if "tolling_intervals" in payload:
+                continue
+            intervals = []
+            clock_paused = False
+            paused_remaining = None
+            request_day = payload.get("evidence_request_day")
+            if isinstance(request_day, int) and not payload.get("evidence_withdrawn"):
+                state = row["state"]
+                if state == "evidence_requested":
+                    intervals.append({"start_day": request_day, "end_day": None, "reason": "evidence_request", "closed_by": None, "migrated": True})
+                    clock_paused = True
+                    paused_remaining = int(payload["deadline_day"]) - request_day
+                elif state in {"response_received", "decided", "appealed", "closed"}:
+                    end_day = max(int(payload.get("response_day", request_day)), request_day)
+                    intervals.append({"start_day": request_day, "end_day": end_day, "reason": "evidence_request", "closed_by": "respond", "migrated": True})
+                    if state == "response_received":
+                        paused = int(payload["deadline_day"]) - request_day
+                        payload["deadline_day"] = end_day + paused
+                        payload["days_remaining"] = int(payload["deadline_day"]) - end_day
+                        payload["overdue"] = payload["days_remaining"] < 0
+            payload["tolling_intervals"] = intervals
+            payload["clock_paused"] = clock_paused
+            payload["paused_days_remaining"] = paused_remaining
+            payload.setdefault("delivery_method", None)
+            payload.setdefault("delivery_day", None)
+            payload.setdefault("delivery_confirmed", False)
+            payload.setdefault("evidence_withdrawn", False)
+            payload.setdefault("evidence_overdue", False)
+            payload.setdefault("late_days", 0)
+            if "allowed_days" not in payload and isinstance(payload.get("evidence_due_day"), int) and isinstance(request_day, int):
+                payload["allowed_days"] = int(payload["evidence_due_day"]) - request_day
+            details = None
+            if intervals:
+                payload["deadline_basis"] = "旧数据升级：按当前案件状态补齐停表记录"
+                details = {"summary": "旧数据升级：按当前案件状态补齐停表记录", "state": row["state"], "tolling_intervals": intervals, "clock_paused": clock_paused, "paused_days_remaining": paused_remaining}
+            else:
+                payload.setdefault("deadline_basis", "初始期限：受理日第%s日+法定%s天=第%s日" % (payload.get("received_day"), payload.get("deadline_days"), payload.get("deadline_day")))
+            connection.execute("UPDATE records SET payload=? WHERE id=?", (json.dumps(payload, ensure_ascii=False, sort_keys=True), row["id"]))
+            if details is not None:
+                connection.execute(
+                    "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                    (row["id"], "legacy_tolling_backfill", "system", int(row["version"]), json.dumps(details, ensure_ascii=False, sort_keys=True), now),
+                )
 
     @staticmethod
     def _row(row: sqlite3.Row) -> Dict[str, Any]:

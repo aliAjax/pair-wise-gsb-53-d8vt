@@ -6,7 +6,7 @@
 
 - `app.py`：命令行参数、依赖组装和服务启动。
 - `src/domain.py`：领域数据类型、错误和基础校验。
-- `src/rules.py`：状态转换、法定天数、补件期限和材料完整性和冲突检查。
+- `src/rules.py`：状态转换、法定天数、补件停表、送达方式与期限重算、材料完整性和冲突检查。
 - `src/repository.py`：SQLite建表、事务和查询。
 - `src/service.py`：用例编排、权限检查、乐观并发和审计。
 - `src/http_api.py`：HTTP路由与统一错误响应。
@@ -34,6 +34,16 @@ python3 app.py --db ./data.db --port 8329
 - `POST /api/records/{id}/actions/{action}`：执行业务动作，请求体为`{"expected_version":1,"data":{...}}`。
 
 除`/health`和`/`外，请求需提供`X-User-Id`、`X-Role`，可选`X-Org`。
+
+## 补件停表与送达
+
+- `request_evidence`（case_officer）：发出补件要求，主期限剩余天数立即暂停并记录停表区间起点；请求体需带`evidence_request_day`、`allowed_days`、`delivery_method`（`mail`/`electronic`/`personal`，邮寄按3天送达在途计算），补件期限先按发出日暂定。
+- `confirm_delivery`（case_officer）：确认`delivery_day`与送达方式后重算补件期限；两名经办同时提交以`expected_version`先到先得，后到者收到409版本冲突，期限与审计事件在同一事务写入。
+- `change_delivery_method`（supervisor）：变更送达方式，旧补件期限立即失效并按新送达在途天数重算。
+- `withdraw_evidence`（supervisor）：撤回补件，旧补件期限立即失效，停表区间闭口，主期限按暂停时剩余天数恢复，案件回到`submitted`。
+- `respond`：晚于补件期限的回应进入逾期（`evidence_overdue`/`late_days`），不再直接拒绝；已发生的停表区间保留在`tolling_intervals`中。
+- 每次重算的依据写入记录`deadline_basis`字段与审计事件的`calculation`字段，记录详情与审计时间线均可查看。
+- 服务启动时自动迁移旧数据：按当前案件状态补齐停表区间（`evidence_requested`补开口区间、`response_received`及之后补闭口区间并顺延主期限），并写入`legacy_tolling_backfill`审计事件，迁移幂等可重复执行。
 
 ## 测试
 
